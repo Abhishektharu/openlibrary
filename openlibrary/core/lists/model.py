@@ -1,6 +1,7 @@
 """Helper functions used by the List model.
 """
 from functools import cached_property
+from typing import TypedDict, cast
 
 import web
 import logging
@@ -11,32 +12,112 @@ from infogami.utils import stats
 
 from openlibrary.core import helpers as h
 from openlibrary.core import cache
+from openlibrary.core.models import Image, Subject, Thing, ThingKey
+from openlibrary.plugins.upstream.models import Author, Changeset, Edition, User, Work
 
 from openlibrary.plugins.worksearch.search import get_solr
+from openlibrary.plugins.worksearch.subjects import get_subject
 import contextlib
 
 logger = logging.getLogger("openlibrary.lists.model")
 
-# this will be imported on demand to avoid circular dependency
-subjects = None
+
+class SeedDict(TypedDict):
+    key: ThingKey
 
 
-def get_subject(key):
-    global subjects
-    if subjects is None:
-        from openlibrary.plugins.worksearch import subjects
-    return subjects.get_subject(key)
+SeedSubjectString = str
+"""
+When a subject is added to a list, it's added as a string like:
+- "subject:foo"
+- "person:floyd_heywood"
+"""
 
 
-class ListMixin:
-    def _get_rawseeds(self):
-        def process(seed):
-            if isinstance(seed, str):
-                return seed
-            else:
-                return seed.key
+class List(Thing):
+    """Class to represent /type/list objects in OL.
 
-        return [process(seed) for seed in self.seeds]
+    List contains the following properties, theoretically:
+        * cover - id of the book cover. Picked from one of its editions.
+        * tags - list of tags to describe this list.
+    """
+
+    name: str | None
+    """Name of the list"""
+
+    description: str | None
+    """Detailed description of the list (markdown)"""
+
+    seeds: list[Thing | SeedSubjectString]
+    """Members of the list. Either references or subject strings."""
+
+    def url(self, suffix="", **params):
+        return self.get_url(suffix, **params)
+
+    def get_url_suffix(self):
+        return self.name or "unnamed"
+
+    def get_owner(self) -> User | None:
+        if match := web.re_compile(r"(/people/[^/]+)/lists/OL\d+L").match(self.key):
+            key = match.group(1)
+            return cast(User, self._site.get(key))
+        else:
+            return None
+
+    def get_cover(self):
+        """Returns a cover object."""
+        return self.cover and Image(self._site, "b", self.cover)
+
+    def get_tags(self):
+        """Returns tags as objects.
+
+        Each tag object will contain name and url fields.
+        """
+        return [web.storage(name=t, url=self.key + "/tags/" + t) for t in self.tags]
+
+    def add_seed(self, seed: Thing | SeedDict | SeedSubjectString):
+        """
+        Adds a new seed to this list.
+
+        seed can be:
+            - a `Thing`: author, edition or work object
+            - a key dict: {"key": "..."} for author, edition or work objects
+            - a string: for a subject
+        """
+        if isinstance(seed, dict):
+            seed = Thing(self._site, seed['key'], None)
+
+        if self._index_of_seed(seed) >= 0:
+            return False
+        else:
+            self.seeds = self.seeds or []
+            self.seeds.append(seed)
+            return True
+
+    def remove_seed(self, seed: Thing | SeedDict | SeedSubjectString):
+        """Removes a seed for the list."""
+        if isinstance(seed, dict):
+            seed = Thing(self._site, seed['key'], None)
+
+        if (index := self._index_of_seed(seed)) >= 0:
+            self.seeds.pop(index)
+            return True
+        else:
+            return False
+
+    def _index_of_seed(self, seed: Thing | SeedSubjectString) -> int:
+        if isinstance(seed, Thing):
+            seed = seed.key
+        for i, s in enumerate(self._get_seed_strings()):
+            if s == seed:
+                return i
+        return -1
+
+    def __repr__(self):
+        return f"<List: {self.key} ({self.name!r})>"
+
+    def _get_seed_strings(self) -> list[SeedSubjectString | ThingKey]:
+        return [seed if isinstance(seed, str) else seed.key for seed in self.seeds]
 
     @cached_property
     def last_update(self):
@@ -138,7 +219,7 @@ class ListMixin:
             for k in doc['edition_key']:
                 yield "/books/" + k
 
-    def get_export_list(self) -> dict[str, list]:
+    def get_export_list(self) -> dict[str, list[dict]]:
         """Returns all the editions, works and authors of this list in arbitrary order.
 
         The return value is an iterator over all the entries. Each entry is a dictionary.
@@ -146,34 +227,24 @@ class ListMixin:
         This works even for lists with too many seeds as it doesn't try to
         return entries in the order of last-modified.
         """
-
-        # Separate by type each of the keys
-        edition_keys = {
-            seed.key for seed in self.seeds if seed and seed.type.key == '/type/edition'  # type: ignore[attr-defined]
-        }
-        work_keys = {
-            "/works/%s" % seed.key.split("/")[-1] for seed in self.seeds if seed and seed.type.key == '/type/work'  # type: ignore[attr-defined]
-        }
-        author_keys = {
-            "/authors/%s" % seed.key.split("/")[-1] for seed in self.seeds if seed and seed.type.key == '/type/author'  # type: ignore[attr-defined]
-        }
+        # Make one db call to fetch fully loaded Thing instances. By
+        # default they are 'shell' instances that dynamically get fetched
+        # as you access their attributes.
+        things = cast(
+            list[Thing],
+            web.ctx.site.get_many(
+                [seed.key for seed in self.seeds if isinstance(seed, Thing)]
+            ),
+        )
 
         # Create the return dictionary
-        export_list = {}
-        if edition_keys:
-            export_list["editions"] = [
-                doc.dict() for doc in web.ctx.site.get_many(list(edition_keys))
-            ]
-        if work_keys:
-            export_list["works"] = [
-                doc.dict() for doc in web.ctx.site.get_many(list(work_keys))
-            ]
-        if author_keys:
-            export_list["authors"] = [
-                doc.dict() for doc in web.ctx.site.get_many(list(author_keys))
-            ]
-
-        return export_list
+        return {
+            "editions": [
+                thing.dict() for thing in things if isinstance(thing, Edition)
+            ],
+            "works": [thing.dict() for thing in things if isinstance(thing, Work)],
+            "authors": [thing.dict() for thing in things if isinstance(thing, Author)],
+        }
 
     def _preload(self, keys):
         keys = list(set(keys))
@@ -278,8 +349,8 @@ class ListMixin:
                 d[kind].append(s)
         return d
 
-    def get_seeds(self, sort=False, resolve_redirects=False):
-        seeds = []
+    def get_seeds(self, sort=False, resolve_redirects=False) -> list['Seed']:
+        seeds: list['Seed'] = []
         for s in self.seeds:
             seed = Seed(self, s)
             max_checks = 10
@@ -293,15 +364,10 @@ class ListMixin:
 
         return seeds
 
-    def get_seed(self, seed):
+    def has_seed(self, seed: SeedDict | SeedSubjectString) -> bool:
         if isinstance(seed, dict):
             seed = seed['key']
-        return Seed(self, seed)
-
-    def has_seed(self, seed):
-        if isinstance(seed, dict):
-            seed = seed['key']
-        return seed in self._get_rawseeds()
+        return seed in self._get_seed_strings()
 
     # cache the default_cover_id for 60 seconds
     @cache.memoize(
@@ -332,7 +398,11 @@ class Seed:
         * cover
     """
 
-    def __init__(self, list, value: web.storage | str):
+    key: ThingKey | SeedSubjectString
+
+    value: Thing | SeedSubjectString
+
+    def __init__(self, list: List, value: Thing | SeedSubjectString):
         self._list = list
         self._type = None
 
@@ -344,7 +414,7 @@ class Seed:
             self.key = value.key
 
     @cached_property
-    def document(self):
+    def document(self) -> Subject | Thing:
         if isinstance(self.value, str):
             return get_subject(self.get_subject_url(self.value))
         else:
@@ -381,7 +451,7 @@ class Seed:
         return "unknown"
 
     @property
-    def title(self):
+    def title(self) -> str:
         if self.type in ("work", "edition"):
             return self.document.title or self.key
         elif self.type == "author":
@@ -401,7 +471,7 @@ class Seed:
             else:
                 return "/subjects/" + self.key
 
-    def get_subject_url(self, subject):
+    def get_subject_url(self, subject: SeedSubjectString) -> str:
         if subject.startswith("subject:"):
             return "/subjects/" + web.lstrips(subject, "subject:")
         else:
@@ -444,3 +514,29 @@ class Seed:
         return f"<seed: {self.type} {self.key}>"
 
     __str__ = __repr__
+
+
+class ListChangeset(Changeset):
+    def get_added_seed(self):
+        added = self.data.get("add")
+        if added and len(added) == 1:
+            return self.get_seed(added[0])
+
+    def get_removed_seed(self):
+        removed = self.data.get("remove")
+        if removed and len(removed) == 1:
+            return self.get_seed(removed[0])
+
+    def get_list(self):
+        return self.get_changes()[0]
+
+    def get_seed(self, seed):
+        """Returns the seed object."""
+        if isinstance(seed, dict):
+            seed = self._site.get(seed['key'])
+        return Seed(self.get_list(), seed)
+
+
+def register_models():
+    client.register_thing_class('/type/list', List)
+    client.register_changeset_class('lists', ListChangeset)
